@@ -1,0 +1,225 @@
+import json
+import fs
+import env
+import process
+
+// Microsoft Authentication for Minecraft Java Edition.
+// Device Code Flow: MS → Xbox Live → XSTS → Minecraft → Profile.
+//
+// Usage:
+//   import mc_auth
+//   let profile = mc_auth.authenticate()!
+//   // profile.username, profile.uuid, profile.access_token
+
+// Xbox Live auth title (Nintendo Switch - same as prismarine-auth)
+let CLIENT_ID = "00000000441cc96b"
+let MS_DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
+let MS_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+let XBOX_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
+let XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
+let MC_AUTH_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
+let MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+let CACHE_PATH = "/.minecraft-almide-auth.json"
+
+// --- HTTP helpers (curl, workaround for rustls TLS with MS servers) ---
+
+local effect fn http_post(url: String, body: String, content_type: String) -> Result[String, String] =
+  process.exec("curl", ["-s", "-X", "POST", "-H", "Content-Type: ${content_type}", "-d", body, url])
+
+local effect fn http_post_json(url: String, body: String) -> Result[String, String] =
+  process.exec("curl", ["-s", "-X", "POST", "-H", "Content-Type: application/json", "-H", "Accept: application/json", "-d", body, url])
+
+local effect fn http_get_auth(url: String, token: String) -> Result[String, String] =
+  process.exec("curl", ["-s", "-H", "Authorization: Bearer ${token}", url])
+
+// --- Types ---
+
+type Profile = {
+  username: String,
+  uuid: String,
+  access_token: String,
+}
+
+type DeviceCode = {
+  device_code: String,
+  user_code: String,
+  verification_uri: String,
+  interval: Int,
+}
+
+// --- Token Cache ---
+
+local effect fn cache_file() -> String = {
+  let home = match env.get("HOME") {
+    some(h) => h,
+    none => "/tmp",
+  }
+  "${home}${CACHE_PATH}"
+}
+
+local effect fn load_cache() -> Option[Profile] = {
+  let path = cache_file()!
+  if fs.exists(path) then {
+    let text = fs.read_text(path) ?? ""
+    let j = json.parse(text) ?? json.null()
+    let username = json.get_string(j, "username") ?? ""
+    let uuid = json.get_string(j, "uuid") ?? ""
+    let token = json.get_string(j, "access_token") ?? ""
+    if string.len(username) > 0 and string.len(token) > 0 then
+      some({ username: username, uuid: uuid, access_token: token })
+    else
+      none
+  } else {
+    none
+  }
+}
+
+local effect fn save_cache(profile: Profile) -> Result[Unit, String] = {
+  let j = json.object([
+    ("username", json.from_string(profile.username)),
+    ("uuid", json.from_string(profile.uuid)),
+    ("access_token", json.from_string(profile.access_token)),
+  ])
+  fs.write(cache_file()!, json.stringify(j))
+}
+
+// --- Step 1: Device Code ---
+
+effect fn request_device_code() -> Result[DeviceCode, String] = {
+  let body = "client_id=${CLIENT_ID}&scope=service::user.auth.xboxlive.com::MBI_SSL&response_type=device_code"
+  let resp = http_post(MS_DEVICE_CODE_URL, body, "application/x-www-form-urlencoded")!
+  let j = json.parse(resp)!
+  ok({
+    device_code: json.get_string(j, "device_code") ?? "",
+    user_code: json.get_string(j, "user_code") ?? "",
+    verification_uri: json.get_string(j, "verification_uri") ?? "https://www.microsoft.com/link",
+    interval: json.get_int(j, "interval") ?? 5,
+  })
+}
+
+// --- Step 2: Poll for MS Token ---
+
+effect fn poll_for_token(device_code: String, interval: Int) -> Result[String, String] = {
+  let body = "client_id=${CLIENT_ID}&device_code=${device_code}&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+  var attempts = 0
+  var token = ""
+  while string.len(token) == 0 and attempts < 120 {
+    process.sleep(interval * 1000)
+    let resp = http_post(MS_TOKEN_URL, body, "application/x-www-form-urlencoded") ?? ""
+    let j = json.parse(resp) ?? json.null()
+    let access = json.get_string(j, "access_token") ?? ""
+    if string.len(access) > 0 then {
+      token = access
+    } else {
+      let error = json.get_string(j, "error") ?? ""
+      guard error != "authorization_declined" else err("Authorization declined by user")
+      guard error != "expired_token" else err("Device code expired. Try again.")
+    }
+    attempts = attempts + 1
+  }
+  guard string.len(token) > 0 else err("Timed out waiting for authentication")
+  ok(token)
+}
+
+// --- Step 3: Xbox Live ---
+
+effect fn authenticate_xbox(ms_token: String) -> Result[{ token: String, user_hash: String }, String] = {
+  let body = json.stringify(json.object([
+    ("Properties", json.object([
+      ("AuthMethod", json.from_string("RPS")),
+      ("SiteName", json.from_string("user.auth.xboxlive.com")),
+      ("RpsTicket", json.from_string("t=${ms_token}")),
+    ])),
+    ("RelyingParty", json.from_string("http://auth.xboxlive.com")),
+    ("TokenType", json.from_string("JWT")),
+  ]))
+  let resp = http_post_json(XBOX_AUTH_URL, body)!
+  let j = json.parse(resp)!
+  let token = json.get_string(j, "Token") ?? ""
+  let claims = json.get(j, "DisplayClaims") ?? json.null()
+  let xui_arr = json.get_array(claims, "xui") ?? []
+  let xui_first = list.first(xui_arr) ?? json.null()
+  let xui = json.get_string(xui_first, "uhs") ?? ""
+  ok({ token: token, user_hash: xui })
+}
+
+// --- Step 4: XSTS ---
+
+effect fn authenticate_xsts(xbox_token: String) -> Result[String, String] = {
+  let body = json.stringify(json.object([
+    ("Properties", json.object([
+      ("SandboxId", json.from_string("RETAIL")),
+      ("UserTokens", json.array([json.from_string(xbox_token)])),
+    ])),
+    ("RelyingParty", json.from_string("rp://api.minecraftservices.com/")),
+    ("TokenType", json.from_string("JWT")),
+  ]))
+  let resp = http_post_json(XSTS_AUTH_URL, body)!
+  let j = json.parse(resp)!
+  ok(json.get_string(j, "Token") ?? "")
+}
+
+// --- Step 5: Minecraft Token ---
+
+effect fn authenticate_minecraft(xsts_token: String, user_hash: String) -> Result[String, String] = {
+  let body = json.stringify(json.object([
+    ("identityToken", json.from_string("XBL3.0 x=${user_hash};${xsts_token}")),
+  ]))
+  let resp = http_post_json(MC_AUTH_URL, body)!
+  let j = json.parse(resp)!
+  ok(json.get_string(j, "access_token") ?? "")
+}
+
+// --- Step 6: Profile ---
+
+effect fn get_profile(mc_token: String) -> Result[Profile, String] = {
+  let resp = http_get_auth(MC_PROFILE_URL, mc_token)!
+  let j = json.parse(resp)!
+  let username = json.get_string(j, "name") ?? ""
+  let uuid = json.get_string(j, "id") ?? ""
+  guard string.len(username) > 0 else err("No Minecraft profile found for this account")
+  ok({ username: username, uuid: uuid, access_token: mc_token })
+}
+
+// --- Public API ---
+
+// Full authentication flow with token caching.
+// On first run, prompts user for device code login.
+// On subsequent runs, uses cached token (validates first).
+effect fn authenticate() -> Result[Profile, String] = {
+  let cached = load_cache()
+  match cached {
+    some(profile) => {
+      let check = http_get_auth(MC_PROFILE_URL, profile.access_token) ?? ""
+      let j = json.parse(check) ?? json.null()
+      let name = json.get_string(j, "name") ?? ""
+      if string.len(name) > 0 then {
+        println("[Auth] Cached: ${profile.username}")
+        ok(profile)
+      } else {
+        println("[Auth] Token expired, re-authenticating...")
+        authenticate_fresh()
+      }
+    },
+    none => authenticate_fresh(),
+  }
+}
+
+// Full authentication without cache.
+effect fn authenticate_fresh() -> Result[Profile, String] = {
+  println("[Auth] Microsoft authentication...")
+  let dc = request_device_code()!
+  println("[Auth] Open ${dc.verification_uri} and enter code: ${dc.user_code}")
+  let ms_token = poll_for_token(dc.device_code, dc.interval)!
+  println("[Auth] MS token obtained")
+  let xbox = authenticate_xbox(ms_token)!
+  println("[Auth] Xbox Live OK")
+  let xsts_token = authenticate_xsts(xbox.token)!
+  println("[Auth] XSTS OK")
+  let mc_token = authenticate_minecraft(xsts_token, xbox.user_hash)!
+  println("[Auth] MC token OK")
+  let profile = get_profile(mc_token)!
+  println("[Auth] ${profile.username} (${profile.uuid})")
+  save_cache(profile)!
+  ok(profile)
+}
