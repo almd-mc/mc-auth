@@ -1,0 +1,49 @@
+import json
+
+// mc-auth tests: Profile type and auth URL constants
+
+type Profile = {
+  username: String,
+  uuid: String,
+  access_token: String,
+}
+
+test "profile construction" {
+  let p: Profile = { username: "Steve", uuid: "abc-123", access_token: "tok" }
+  assert_eq(p.username, "Steve")
+  assert_eq(p.uuid, "abc-123")
+}
+
+test "profile spread update" {
+  let p: Profile = { username: "Steve", uuid: "abc", access_token: "old" }
+  let updated = { ...p, access_token: "new" }
+  assert_eq(updated.username, "Steve")
+  assert_eq(updated.access_token, "new")
+}
+
+test "xbox auth response parsing" {
+  let resp = "{\"Token\":\"xbox_token_123\",\"DisplayClaims\":{\"xui\":[{\"uhs\":\"user_hash_456\"}]}}"
+  match json.parse(resp) {
+    ok(v) => {
+      let token = value.as_string(value.get(v, "Token") ?? value.null()) ?? ""
+      assert_eq(token, "xbox_token_123")
+      let xui = value.as_array(value.get(value.get(v, "DisplayClaims") ?? value.null(), "xui") ?? value.null()) ?? []
+      let uhs = value.as_string(value.get(list.get(xui, 0) ?? value.null(), "uhs") ?? value.null()) ?? ""
+      assert_eq(uhs, "user_hash_456")
+    },
+    err(_) => assert(false),
+  }
+}
+
+test "mc profile response parsing" {
+  let resp = "{\"id\":\"951640b1d2b44919ba123499ee6bc156\",\"name\":\"aidonadmin01\"}"
+  match json.parse(resp) {
+    ok(v) => {
+      let name = value.as_string(value.get(v, "name") ?? value.null()) ?? ""
+      let id = value.as_string(value.get(v, "id") ?? value.null()) ?? ""
+      assert_eq(name, "aidonadmin01")
+      assert(string.len(id) > 0)
+    },
+    err(_) => assert(false),
+  }
+}
