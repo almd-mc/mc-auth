@@ -187,7 +187,7 @@ effect fn get_profile(mc_token: String) -> Result[Profile, String] = {
 // On first run, prompts user for device code login.
 // On subsequent runs, uses cached token (validates first).
 effect fn authenticate() -> Result[Profile, String] = {
-  let cached = load_cache()
+  let cached = load_cache()!
   match cached {
     some(profile) => {
       let check = http_get_auth(MC_PROFILE_URL, profile.access_token) ?? ""
